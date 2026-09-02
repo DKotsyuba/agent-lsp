@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -144,7 +145,13 @@ func HandleRestartLspServer(ctx context.Context, client *lsp.LSPClient, args map
 	return types.TextResult("LSP server restarted successfully. Note: in multi-server configurations only the default server was restarted; other configured servers are unaffected."), nil
 }
 
-// HandleOpenDocument opens a document in the LSP server.
+// HandleOpenDocument opens a document in the LSP server. args: file_path
+// (required, validated against the workspace root), language_id (optional,
+// inferred from the extension) and text (optional; when omitted the file's
+// current disk content is sent, since the server treats the didOpen text as
+// the document). Reopening an already open document sends a full-content
+// didChange instead. Returns an error result for a missing/invalid path or a
+// failed send; on success it may also shift the auto-scope to the file's package.
 func HandleOpenDocument(ctx context.Context, client *lsp.LSPClient, args map[string]any) (types.ToolResult, error) {
 	if err := CheckInitialized(client); err != nil {
 		return types.ErrorResult(err.Error()), nil
@@ -156,7 +163,8 @@ func HandleOpenDocument(ctx context.Context, client *lsp.LSPClient, args map[str
 	}
 
 	// Validate path to prevent traversal attacks, consistent with WithDocument.
-	if _, err := ValidateFilePath(filePath, client.RootDir()); err != nil {
+	cleanPath, err := ValidateFilePath(filePath, client.RootDir())
+	if err != nil {
 		return types.ErrorResult(fmt.Sprintf("invalid file_path: %s", err)), nil
 	}
 
@@ -166,9 +174,17 @@ func HandleOpenDocument(ctx context.Context, client *lsp.LSPClient, args map[str
 	}
 
 	// text is an optional Go-specific extension not present in the TypeScript schema.
-	// Callers may provide file content directly to avoid a disk read.
-	// If omitted or empty, the LSP server will read the file from disk on didOpen.
+	// Callers may provide file content directly to avoid a disk read. When it is
+	// omitted the file is read from disk: the didOpen text is authoritative for
+	// the server (it does not read the file itself), so an empty text would make
+	// it analyse an empty document until the next reopen. If the file cannot be
+	// read (e.g. a not-yet-saved document) the document is opened empty.
 	text, _ := args["text"].(string)
+	if text == "" {
+		if data, readErr := os.ReadFile(cleanPath); readErr == nil {
+			text = string(data)
+		}
+	}
 	fileURI := CreateFileURI(filePath)
 
 	if err := client.OpenDocument(ctx, fileURI, text, languageID); err != nil {

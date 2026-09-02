@@ -24,6 +24,7 @@ package lsp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -112,6 +113,10 @@ type docMeta struct {
 	filePath   string
 	languageID string
 	version    int
+	// hash is the SHA-256 of the text last sent to the server for this
+	// document (zero before the first send). ReopenDocument compares it with
+	// the disk content to skip a didClose/didOpen that would carry no change.
+	hash [32]byte
 }
 
 // LSPClient is the core LSP subprocess client. It spawns the LSP binary, handles
@@ -158,6 +163,24 @@ type LSPClient struct {
 	diagMu   sync.RWMutex
 	diags    map[string][]types.LSPDiagnostic
 	diagSubs []types.DiagnosticUpdateCallback
+	// diagVer counts publishDiagnostics notifications received per normalized
+	// URI (monotonic, starts at 0 for never-published URIs). Guarded by diagMu.
+	diagVer map[string]uint64
+	// diagSync records, per normalized URI, the value of diagVer at the moment
+	// the client last sent the document's content (didOpen/didChange). A
+	// publish is fresh when diagVer has advanced past it, which detects "the
+	// server answered our latest text" without guessing whether a callback
+	// was a cache replay. Guarded by diagMu.
+	diagSync map[string]uint64
+	// diagPubVer records, per normalized URI, the document version stamped on
+	// the latest publishDiagnostics (LSP 3.15 `version`), or -1 when the server
+	// omitted it. Guarded by diagMu.
+	diagPubVer map[string]int
+	// diagStamped becomes true once any publish carried a document version.
+	// A stamping server's unstamped publishes (e.g. the empty clear pyright
+	// sends on didClose) are then known not to describe the open text.
+	// Guarded by diagMu.
+	diagStamped bool
 
 	// workspace readiness ($/progress)
 	progressMu     sync.Mutex
@@ -213,6 +236,9 @@ func NewLSPClient(serverPath string, serverArgs []string) *LSPClient {
 		pending:        make(map[int]*pendingRequest),
 		openDocs:       make(map[string]docMeta),
 		diags:          make(map[string][]types.LSPDiagnostic),
+		diagVer:        make(map[string]uint64),
+		diagSync:       make(map[string]uint64),
+		diagPubVer:     make(map[string]int),
 		progressTokens: make(map[any]struct{}),
 		capabilities:   make(map[string]any),
 		warmup:         newWarmupState(),
@@ -260,6 +286,9 @@ func NewDaemonClient(info *DaemonInfo) (*LSPClient, error) {
 		pending:        make(map[int]*pendingRequest),
 		openDocs:       make(map[string]docMeta),
 		diags:          make(map[string][]types.LSPDiagnostic),
+		diagVer:        make(map[string]uint64),
+		diagSync:       make(map[string]uint64),
+		diagPubVer:     make(map[string]int),
 		progressTokens: make(map[any]struct{}),
 		capabilities:   allCaps,
 		warmup:         newWarmupState(),
@@ -300,6 +329,9 @@ func NewPassiveClient(addr string) (*LSPClient, error) {
 		pending:        make(map[int]*pendingRequest),
 		openDocs:       make(map[string]docMeta),
 		diags:          make(map[string][]types.LSPDiagnostic),
+		diagVer:        make(map[string]uint64),
+		diagSync:       make(map[string]uint64),
+		diagPubVer:     make(map[string]int),
 		progressTokens: make(map[any]struct{}),
 		capabilities:   make(map[string]any),
 		warmup:         newWarmupState(),
@@ -609,6 +641,7 @@ func (c *LSPClient) sendResponse(id json.RawMessage, result any) {
 func (c *LSPClient) handlePublishDiagnostics(params json.RawMessage) {
 	var p struct {
 		URI         string                `json:"uri"`
+		Version     *int                  `json:"version"`
 		Diagnostics []types.LSPDiagnostic `json:"diagnostics"`
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
@@ -619,7 +652,15 @@ func (c *LSPClient) handlePublishDiagnostics(params json.RawMessage) {
 	c.warmup.NotifyDiagnostic()
 
 	c.diagMu.Lock()
-	c.diags[NormalizeFileURI(p.URI)] = p.Diagnostics
+	norm := NormalizeFileURI(p.URI)
+	c.diags[norm] = p.Diagnostics
+	c.diagVer[norm]++
+	if p.Version != nil {
+		c.diagPubVer[norm] = *p.Version
+		c.diagStamped = true
+	} else {
+		c.diagPubVer[norm] = -1
+	}
 	subs := make([]types.DiagnosticUpdateCallback, len(c.diagSubs))
 	copy(subs, c.diagSubs)
 	c.diagMu.Unlock()
@@ -1328,6 +1369,7 @@ func (c *LSPClient) OpenDocument(ctx context.Context, uri, text, languageID stri
 		meta.version++
 		c.openDocs[uri] = meta
 		c.mu.Unlock()
+		c.noteContentSent(uri, []byte(text))
 		return c.sendNotification("textDocument/didChange", map[string]any{
 			"textDocument": map[string]any{
 				"uri":     uri,
@@ -1346,6 +1388,7 @@ func (c *LSPClient) OpenDocument(ctx context.Context, uri, text, languageID stri
 		version:    1,
 	}
 	c.mu.Unlock()
+	c.noteContentSent(uri, []byte(text))
 
 	return c.sendNotification("textDocument/didOpen", map[string]any{
 		"textDocument": map[string]any{
@@ -1410,6 +1453,77 @@ func (c *LSPClient) GetAllDiagnostics() map[string][]types.LSPDiagnostic {
 		out[uri] = cp
 	}
 	return out
+}
+
+// noteContentSent records that the server now holds text for uri: it stores
+// the content hash on the open-document metadata (so ReopenDocument can skip a
+// reopen when the disk file is unchanged) and moves the diagnostics sync point
+// (diagSync) to the current publish count so DiagnosticsFresh accepts only
+// publishes issued after this send. Call it immediately BEFORE the
+// didOpen/didChange notification goes out, so the publish answering it cannot
+// be counted before the sync point is set. A uri that is not tracked in
+// openDocs still gets its sync point moved.
+func (c *LSPClient) noteContentSent(uri string, text []byte) {
+	sum := sha256.Sum256(text)
+	c.mu.Lock()
+	if meta, ok := c.openDocs[uri]; ok {
+		meta.hash = sum
+		c.openDocs[uri] = meta
+	}
+	c.mu.Unlock()
+
+	norm := NormalizeFileURI(uri)
+	c.diagMu.Lock()
+	c.diagSync[norm] = c.diagVer[norm]
+	c.diagMu.Unlock()
+}
+
+// PublishedVersion returns the document version stamped on the latest
+// publishDiagnostics for uri and true, or (0, false) when the server omitted
+// the version or never published for uri. Used by the daemon broker to forward
+// the stamp to connected clients.
+func (c *LSPClient) PublishedVersion(uri string) (int, bool) {
+	c.diagMu.RLock()
+	defer c.diagMu.RUnlock()
+	v, ok := c.diagPubVer[NormalizeFileURI(uri)]
+	if !ok || v < 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// DiagnosticsFresh reports whether the cached diagnostics for uri describe the
+// text the client last sent for it: at least one publish must have arrived
+// after the sync point recorded by noteContentSent (for a URI whose content was
+// never sent, after any publish at all), and, when the server is known to stamp
+// document versions, the latest publish must be stamped with a version at
+// least equal to the version of the open document. Unstamped publishes from a
+// stamping server (the empty clear some servers send on didClose) therefore do
+// not count; for servers that never stamp, any publish after the sync point
+// counts. A URI that is not an open document skips the version comparison.
+func (c *LSPClient) DiagnosticsFresh(uri string) bool {
+	norm := NormalizeFileURI(uri)
+
+	docVersion, open := 0, false
+	c.mu.Lock()
+	for u, meta := range c.openDocs {
+		if NormalizeFileURI(u) == norm {
+			docVersion, open = meta.version, true
+			break
+		}
+	}
+	c.mu.Unlock()
+
+	c.diagMu.RLock()
+	defer c.diagMu.RUnlock()
+	if c.diagVer[norm] <= c.diagSync[norm] {
+		return false
+	}
+	if !c.diagStamped || !open {
+		return true
+	}
+	pub, ok := c.diagPubVer[norm]
+	return ok && pub >= docVersion
 }
 
 // SubscribeToDiagnostics registers cb to be called on every publishDiagnostics notification.
@@ -1498,7 +1612,14 @@ func languageIDFromURI(uri string) string {
 	return "plaintext"
 }
 
-// ReopenDocument closes (didClose without removing metadata), re-reads from disk, re-opens.
+// ReopenDocument makes the server's copy of uri match the file on disk. If uri
+// is not tracked it is opened from disk. If the disk content is byte-identical
+// to the text last sent (docMeta.hash) nothing is sent: the server already
+// analyses that text, and a didClose/didOpen would only make some servers
+// (pyright) emit an unstamped empty clear that WaitForDiagnostics could
+// mistake for the result. Otherwise it sends didClose (keeping the metadata),
+// bumps the version, records the diagnostics sync point and sends didOpen
+// with the new text. Returns read or send errors.
 func (c *LSPClient) ReopenDocument(ctx context.Context, uri string) error {
 	c.mu.Lock()
 	meta, ok := c.openDocs[uri]
@@ -1514,6 +1635,16 @@ func (c *LSPClient) ReopenDocument(ctx context.Context, uri string) error {
 		return c.OpenDocument(ctx, uri, string(data), languageIDFromURI(uri))
 	}
 
+	// Re-read from disk.
+	data, err := os.ReadFile(meta.filePath)
+	if err != nil {
+		return fmt.Errorf("reopen read %s: %w", meta.filePath, err)
+	}
+	if sha256.Sum256(data) == meta.hash {
+		logging.Log(logging.LevelDebug, "ReopenDocument: disk content unchanged, skipping reopen: "+uri)
+		return nil
+	}
+
 	// didClose without removing metadata.
 	if err := c.sendNotification("textDocument/didClose", map[string]any{
 		"textDocument": map[string]any{"uri": uri},
@@ -1521,17 +1652,12 @@ func (c *LSPClient) ReopenDocument(ctx context.Context, uri string) error {
 		return err
 	}
 
-	// Re-read from disk.
-	data, err := os.ReadFile(meta.filePath)
-	if err != nil {
-		return fmt.Errorf("reopen read %s: %w", meta.filePath, err)
-	}
-
 	// Re-open.
 	c.mu.Lock()
 	meta.version++
 	c.openDocs[uri] = meta
 	c.mu.Unlock()
+	c.noteContentSent(uri, data)
 
 	return c.sendNotification("textDocument/didOpen", map[string]any{
 		"textDocument": map[string]any{
@@ -2363,6 +2489,7 @@ func (c *LSPClient) applyEditsToFile(ctx context.Context, uri string, edits []te
 		version = meta.version
 	}
 	c.mu.Unlock()
+	c.noteContentSent(uri, []byte(newContent))
 
 	return c.sendNotification("textDocument/didChange", map[string]any{
 		"textDocument": map[string]any{

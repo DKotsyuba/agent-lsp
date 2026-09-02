@@ -5,8 +5,11 @@
 //
 // get_diagnostics has special behavior: it reopens the document from disk
 // before collecting diagnostics, ensuring results reflect the latest saved
-// state rather than stale LSP cache. It waits up to 25 seconds for
-// diagnostics to settle (cross-package analysis in Go can be slow).
+// state rather than stale LSP cache (the reopen is skipped when the disk
+// content already matches what the server holds). It then waits until the
+// server has published diagnostics for that content and the stream has been
+// quiet for 500ms, with a 25 second ceiling (cross-package analysis in Go
+// can be slow; servers that never publish fall back to the cached state).
 //
 // suggest_fixes filters the returned actions to a concise summary:
 // title, kind, and whether a command or workspace edit is attached.

@@ -8,7 +8,8 @@
 //  1. Start the language server (pyright/tsserver) as a child process
 //  2. Perform LSP initialize with rootDir
 //  3. Listen on a Unix domain socket
-//  4. Accept connections, proxy JSON-RPC bidirectionally
+//  4. Accept connections, proxy JSON-RPC bidirectionally; server-pushed
+//     textDocument/publishDiagnostics is fanned out to every connection
 //  5. Run warmup gate; set ready=true in daemon.json on completion
 //  6. Auto-exit after 30 minutes of no connected clients
 //  7. Handle SIGTERM: shutdown LSP, cleanup files, exit
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/blackwell-systems/agent-lsp/internal/logging"
+	"github.com/blackwell-systems/agent-lsp/internal/types"
 )
 
 const (
@@ -151,6 +153,33 @@ func RunBroker(cfg BrokerConfig) error {
 		lastDisconn = time.Now()
 	)
 
+	// Fan server-pushed diagnostics out to every connected client. The broker
+	// otherwise proxies only client->server traffic, so without this the
+	// agent-lsp side never sees publishDiagnostics: its cache stays empty and
+	// get_diagnostics runs to its timeout on every call. Registered before the
+	// listener accepts so no publish is lost; the in-process replay done by
+	// SubscribeToDiagnostics is a no-op here because no connection exists yet.
+	client.SubscribeToDiagnostics(func(uri string, diags []types.LSPDiagnostic) {
+		// Callbacks run sequentially on the server read loop, so the stamp
+		// read here belongs to this publish.
+		ver, stamped := client.PublishedVersion(uri)
+		body, err := publishDiagnosticsFrame(uri, diags, ver, stamped)
+		if err != nil {
+			return
+		}
+		connMu.Lock()
+		targets := make([]net.Conn, 0, len(connections))
+		for c := range connections {
+			targets = append(targets, c)
+		}
+		connMu.Unlock()
+		for _, c := range targets {
+			if err := writeFramedMessage(c, body); err != nil {
+				logging.Log(logging.LevelDebug, fmt.Sprintf("broker: failed to forward diagnostics: %v", err))
+			}
+		}
+	})
+
 	// Accept connections in a goroutine.
 	newConns := make(chan net.Conn, 8)
 	go func() {
@@ -180,7 +209,10 @@ func RunBroker(cfg BrokerConfig) error {
 	// Main event loop.
 	for {
 		select {
-		case conn := <-newConns:
+		case rawConn := <-newConns:
+			// Wrap so response writes and forwarded notifications cannot
+			// interleave on the socket.
+			conn := net.Conn(&lockedConn{Conn: rawConn})
 			connMu.Lock()
 			connections[conn] = struct{}{}
 			connCount.Add(1)
@@ -197,6 +229,15 @@ func RunBroker(cfg BrokerConfig) error {
 						logging.Log(logging.LevelWarning, fmt.Sprintf("daemon: panic in broker connection handler: %v", r))
 					}
 				}()
+				// Replay cached diagnostics so a freshly connected client
+				// starts with the daemon's current view, mirroring the replay
+				// SubscribeToDiagnostics performs for in-process subscribers.
+				for uri, diags := range client.GetAllDiagnostics() {
+					ver, stamped := client.PublishedVersion(uri)
+					if body, err := publishDiagnosticsFrame(uri, diags, ver, stamped); err == nil {
+						_ = writeFramedMessage(c, body)
+					}
+				}
 				handleBrokerConnection(ctx, c, client)
 				connMu.Lock()
 				delete(connections, c)
@@ -294,6 +335,48 @@ func handleBrokerConnection(ctx context.Context, conn net.Conn, client *LSPClien
 			_ = client.sendNotification(envelope.Method, envelope.Params)
 		}
 	}
+}
+
+// lockedConn serialises writes to a broker socket connection. Responses are
+// written by the connection's request loop while forwarded server
+// notifications are written from the language-server read loop; without the
+// lock two Content-Length frames could interleave and corrupt the stream.
+// writeFramedMessage issues exactly one Write per frame, so locking Write is
+// sufficient to keep frames atomic. Reads are not serialised (single reader).
+type lockedConn struct {
+	net.Conn
+	wmu sync.Mutex
+}
+
+// Write forwards b to the wrapped connection while holding the write lock and
+// returns the underlying connection's result unchanged.
+func (l *lockedConn) Write(b []byte) (int, error) {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	return l.Conn.Write(b)
+}
+
+// publishDiagnosticsFrame encodes the JSON-RPC body of a
+// textDocument/publishDiagnostics notification for uri as the broker forwards
+// it to connected agent-lsp clients (without Content-Length framing). The
+// document version stamp is included only when stamped is true, preserving
+// the server's stamped/unstamped distinction that DiagnosticsFresh relies on.
+// A nil diags slice is encoded as an empty array so the receiving client
+// records "published, no findings" instead of a JSON null. Returns the
+// marshal error if the diagnostics cannot be encoded.
+func publishDiagnosticsFrame(uri string, diags []types.LSPDiagnostic, version int, stamped bool) ([]byte, error) {
+	if diags == nil {
+		diags = []types.LSPDiagnostic{}
+	}
+	params := map[string]any{"uri": uri, "diagnostics": diags}
+	if stamped {
+		params["version"] = version
+	}
+	return json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "textDocument/publishDiagnostics",
+		"params":  params,
+	})
 }
 
 // readFramedMessage reads a Content-Length framed message from a reader.
