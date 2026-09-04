@@ -3,6 +3,11 @@
 All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, Semantic Versioning.
 
+## [0.19.3-dk.1] - 2026-09-04
+
+### Fixed
+- **Daemon late-response loop:** orphaned JSON-RPC responses are now dropped by both the client and broker instead of being echoed back as methodless requests, preventing repeated request timeouts that made Python `blast_radius` and symbol queries hang or return empty results.
+
 ## [0.19.2] - 2026-09-02
 
 ### Fixed

@@ -3,9 +3,13 @@ package lsp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestReadFramedMessage_SingleMessage verifies basic Content-Length framing roundtrip.
@@ -159,6 +163,70 @@ func TestReadFramedMessage_LFOnly(t *testing.T) {
 	}
 	if string(got) != body {
 		t.Errorf("got %q, want %q", got, body)
+	}
+}
+
+// TestDispatchDropsOrphanedResponse verifies that a late response is not
+// echoed back after its pending request has already been removed.
+func TestDispatchDropsOrphanedResponse(t *testing.T) {
+	server, peer := net.Pipe()
+	defer peer.Close()
+
+	received := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(peer)
+		received <- data
+	}()
+
+	client := NewLSPClient("", nil)
+	client.stdin = server
+	client.dispatch([]byte(`{"jsonrpc":"2.0","id":7,"result":null}`))
+	_ = server.Close()
+
+	if data := <-received; len(data) != 0 {
+		t.Fatalf("orphaned response was echoed: %s", data)
+	}
+}
+
+// TestBrokerDropsMethodlessEnvelopeAndContinues verifies that an orphaned
+// response is ignored without preventing the next valid notification.
+func TestBrokerDropsMethodlessEnvelopeAndContinues(t *testing.T) {
+	broker, peer := net.Pipe()
+	clientRead, clientWrite := net.Pipe()
+	defer clientRead.Close()
+
+	client := NewLSPClient("", nil)
+	client.stdin = clientWrite
+	done := make(chan struct{})
+	go func() {
+		handleBrokerConnection(context.Background(), broker, client)
+		close(done)
+	}()
+
+	orphan := []byte(`{"jsonrpc":"2.0","id":9,"result":null}`)
+	if err := writeFramedMessage(peer, orphan); err != nil {
+		t.Fatalf("write orphaned response: %v", err)
+	}
+	notification := []byte(`{"jsonrpc":"2.0","method":"textDocument/didSave","params":{}}`)
+	if err := writeFramedMessage(peer, notification); err != nil {
+		t.Fatalf("write notification: %v", err)
+	}
+	_ = peer.Close()
+
+	reader := bufio.NewReader(clientRead)
+	got, err := readFramedMessage(reader)
+	if err != nil {
+		t.Fatalf("read forwarded notification: %v", err)
+	}
+	if !bytes.Equal(got, notification) {
+		t.Fatalf("forwarded message = %s, want %s", got, notification)
+	}
+	_ = clientWrite.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("broker did not finish after peer closed")
 	}
 }
 

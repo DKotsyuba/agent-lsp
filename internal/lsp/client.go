@@ -455,7 +455,9 @@ func (c *LSPClient) readLoop() {
 	}
 }
 
-// dispatch decodes and routes one incoming message.
+// dispatch decodes and routes one incoming message. An id-bearing message with
+// no method is always treated as a response; unmatched response IDs are
+// discarded so they cannot be mistaken for server-initiated requests.
 func (c *LSPClient) dispatch(raw []byte) {
 	var msg jsonrpcMsg
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -482,8 +484,7 @@ func (c *LSPClient) dispatch(raw []byte) {
 				return
 			}
 		}
-		// ID present but not an integer we sent — fall through to handle as
-		// a server-initiated request (some servers use string IDs).
+		return
 	}
 
 	// Notification or server-initiated request.

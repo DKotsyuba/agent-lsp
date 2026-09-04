@@ -233,7 +233,10 @@ func RunBroker(cfg BrokerConfig) error {
 // handleBrokerConnection proxies JSON-RPC between a connected client and the
 // language server. The connection uses Content-Length framing (same as LSP stdio).
 // ctx is the broker's lifecycle context; forwarded requests are cancelled when
-// the broker shuts down.
+// the broker shuts down. Envelopes with an empty method (e.g. a stray response
+// echoed back by a misbehaving client) are dropped so they can't be
+// misclassified as a request or notification; the connection stays open for
+// subsequent valid messages.
 func handleBrokerConnection(ctx context.Context, conn net.Conn, client *LSPClient) {
 	defer conn.Close()
 
@@ -253,6 +256,14 @@ func handleBrokerConnection(ctx context.Context, conn net.Conn, client *LSPClien
 			Params json.RawMessage `json:"params,omitempty"`
 		}
 		if err := json.Unmarshal(msg, &envelope); err != nil {
+			continue
+		}
+
+		// An empty method with an id present is a response envelope, not a
+		// request or notification (e.g. a late/orphaned response echoed back
+		// by a misbehaving client). Drop it without touching the connection
+		// so the next legitimate request on the same socket is still served.
+		if envelope.Method == "" {
 			continue
 		}
 
