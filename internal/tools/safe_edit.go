@@ -22,6 +22,13 @@ import (
 // HandleSafeApplyEdit combines preview_edit + apply_edit when net_delta == 0.
 // Returns applied=true on success or applied=false with preview diagnostics
 // when net_delta > 0.
+//
+// The internal preview call to HandleSimulateEditAtomic is always forced to
+// JSON output via ContextWithOutputFormat, regardless of the caller's
+// requested output format, because this function parses that result as JSON
+// to extract net_delta. The final result returned to the caller is still
+// encoded (via EncodeResult) using the original, unmodified ctx, so a caller
+// that requested GCF output still receives GCF.
 func HandleSafeApplyEdit(ctx context.Context, client *lsp.LSPClient, sessionMgr *session.SessionManager, args map[string]any) (types.ToolResult, error) {
 	filePath, ok := args["file_path"].(string)
 	if !ok || filePath == "" {
@@ -92,7 +99,10 @@ func HandleSafeApplyEdit(ctx context.Context, client *lsp.LSPClient, sessionMgr 
 		"new_text":       newText,
 	}
 
-	simResult, err := HandleSimulateEditAtomic(ctx, sessionMgr, simArgs)
+	// Preview is parsed as JSON below regardless of the caller's requested
+	// output format; the final result is still encoded using the original ctx.
+	previewCtx := ContextWithOutputFormat(ctx, "json")
+	simResult, err := HandleSimulateEditAtomic(previewCtx, sessionMgr, simArgs)
 	if err != nil {
 		return types.ErrorResult(fmt.Sprintf("preview failed: %s", err)), nil
 	}
